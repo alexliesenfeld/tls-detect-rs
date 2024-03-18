@@ -15,7 +15,7 @@
  * the License.
  */
 
-//! This library contains utilities to simplify operate multiple protocols through a
+//! This library contains utilities to simplify operating multiple protocols through a
 //! single network port.
 use std::fmt;
 use std::fmt::{Display, Formatter};

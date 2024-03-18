@@ -1,0 +1,11 @@
+[package]
+name = "unified-port"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alexander Liesenfeld <alexander.liesenfeld@outlook.com>"]
+description = "A library to simplify multi-protocol network service simulation on a single port."
+license = "Apache-2.0"
+keywords = ["https", "tls", "check", "probe"]
+categories = ["network-programming"]
+repository = "https://github.com/alexliesenfeld/unified-port-rs"
+readme = "README.md"

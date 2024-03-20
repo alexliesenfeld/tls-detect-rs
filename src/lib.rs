@@ -286,7 +286,7 @@ mod tests {
     use crate::{
         get_encrypted_packet_length, is_encrypted, DTLS_RECORD_HEADER_LENGTH,
         GMSSL_PROTOCOL_VERSION, SSL_CONTENT_TYPE_APPLICATION_DATA, SSL_CONTENT_TYPE_HANDSHAKE,
-        SSL_RECORD_HEADER_LENGTH,
+        SSL_RECORD_HEADER_LENGTH, Error
     };
 
     #[test]
@@ -515,3 +515,79 @@ mod tests {
         );
     }
 }
+
+fn print_hex(slice: &[u8]) -> String {
+    slice.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+pub fn extract_sni_hostname(input: &[u8], offset: usize) -> Result<Option<String>, Error> {
+    let hex_str = print_hex(input);
+    println!("{}", hex_str);
+
+    // We have to skip bytes until SessionID (which sum to 34 bytes in this case).
+    let end_offset = input.len() - 1;
+    let mut offset = offset + 34;
+
+    if end_offset - offset >= 6 {
+        let session_id_length = input[offset] as usize;
+        offset += 1 + session_id_length;
+
+        let cipher_suites_length = read_u16(input, offset, true)? as usize;
+        offset += 2 + cipher_suites_length;
+
+        let compression_methods_length = input[offset] as usize;
+        offset += 1 + compression_methods_length;
+
+        let extensions_length = read_u16(input, offset, true)? as usize;
+        offset += 2;
+        let extensions_limit = offset + extensions_length;
+
+        if extensions_limit < input.len() {
+
+            while extensions_limit - offset >= 4 {
+                let extension_type = read_u16(input, offset, true)? as usize;
+                offset += 2;
+
+                let extension_length = read_u16(input, offset, true)? as usize;
+                offset += 2;
+
+                if extensions_limit - offset < extension_length {
+                    break;
+                }
+
+                // SNI
+                // See https://tools.ietf.org/html/rfc6066#page-6
+
+                if extension_type == 0 {
+                    offset += 2;
+
+                    if extensions_limit - offset < 3 {
+                        break;
+                    }
+
+                    let server_name_type = input[offset];
+                    offset += 1;
+
+                    if server_name_type == 0 {
+                        let server_name_length = read_u16(input, offset, true)? as usize;
+                        offset += 2;
+
+                        if extensions_limit - offset < server_name_length {
+                            break;
+                        }
+
+                        let hostname_bytes = &input[offset..offset + server_name_length];
+                        return Ok(Some(std::str::from_utf8(hostname_bytes).unwrap().to_ascii_lowercase()))
+                    } else {
+                        break
+                    }
+                }
+
+                offset += extension_length;
+            }
+        }
+    }
+
+    Ok(None)
+}
+

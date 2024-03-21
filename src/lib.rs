@@ -17,8 +17,25 @@
 
 //! This library contains utilities to simplify operating multiple protocols through a
 //! single network port.
-use std::fmt;
+//!
 use std::fmt::{Display, Formatter};
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait Read<'a> {
+
+    /// Peeks or reads byte.
+    async fn read_byte(&mut self, from_offset: usize) -> std::io::Result<u8>;
+
+    /// Peeks or reads u16 from big endian.
+    async fn read_bytes(&mut self, from_offset: usize, to_offset: usize) -> std::io::Result<&'a[u8]>;
+
+    /// Peeks or reads u16 from big endian.
+    async fn read_u16_from_be(&mut self, offset: usize) -> std::io::Result<u16>;
+
+    /// Peeks or reads until limit.
+    async fn buffer_to(&mut self, limit: usize) -> std::io::Result<()>;
+}
 
 // ************************************************************************************************
 // Errors
@@ -26,18 +43,29 @@ use std::fmt::{Display, Formatter};
 pub enum Error {
     NotEnoughDataError,
     NotEncryptedError,
+    IoError(std::io::Error),
 }
 
 impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match *self {
             Error::NotEncryptedError => write!(f, "Byte buffer does not seem to be encrypted"),
             Error::NotEnoughDataError => write!(f, "Byte buffer length too short"),
+            Error::IoError(ref err) => write!(f, "IO error: {}", err),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::NotEnoughDataError,
+            _ => Error::IoError(error),
+        }
+    }
+}
 
 // ************************************************************************************************
 // Constants
@@ -159,8 +187,10 @@ const DTLS_RECORD_HEADER_LENGTH: u16 = 13;
 /// The determination is based on whether `get_encrypted_packet_length` returns a packet length greater than 0
 /// or if it encounters an error (e.g., `NotEnoughDataError` or `NotEncryptedError`), in which case it will
 /// return `false`.
-pub fn is_encrypted(buffer: &[u8], offset: usize) -> bool {
-    match get_encrypted_packet_length(buffer, offset) {
+pub async fn is_encrypted<'a, R>(reader: &mut R, offset: usize) -> bool
+    where
+    R: Read<'a>,{
+    match get_encrypted_packet_length(reader, offset).await {
         Ok(length) => length > 0,
         Err(_) => false,
     }
@@ -195,11 +225,14 @@ pub fn is_encrypted(buffer: &[u8], offset: usize) -> bool {
 /// * `NotEnoughDataError` - If the buffer does not contain enough data to determine the packet length.
 /// * `NotEncryptedError` - If the data does not appear to be encrypted according to recognized protocols.
 ///
-pub fn get_encrypted_packet_length(buffer: &[u8], offset: usize) -> Result<u16, Error> {
+pub async fn get_encrypted_packet_length<'a, R>(reader: &mut R, offset: usize) -> Result<u16, Error>
+where
+    R: Read<'a>,
+{
     let mut packet_length: u16 = 0;
 
     // SSLv3 or TLS - Check ContentType
-    let mut tls = match buffer[offset] {
+    let mut tls = match reader.read_byte(offset).await? {
         SSL_CONTENT_TYPE_CHANGE_CIPHER_SPEC
         | SSL_CONTENT_TYPE_ALERT
         | SSL_CONTENT_TYPE_HANDSHAKE
@@ -216,23 +249,21 @@ pub fn get_encrypted_packet_length(buffer: &[u8], offset: usize) -> Result<u16, 
         // TLS 1.2 (RFC 5246) has the version indicated by {3, 3}.
         // TLS 1.3 (RFC 8446) is represented by {3, 4}
         // SSL 3.0 is represented as {3, 4} (but this is SSL, not TLS).
-        let major_version = buffer[offset + 1];
-        let version = read_u16(&buffer, offset + 1, true)? as u16;
+        let major_version = reader.read_byte(offset + 1).await?;
+        let version =  reader.read_u16_from_be(offset + 1).await?;
 
-        if major_version == 3 || version == GMSSL_PROTOCOL_VERSION {
+        if major_version == 3 || version == GMSSL_PROTOCOL_VERSION
+        {
             // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1
-            packet_length = read_u16(buffer, offset + 3, true)? + SSL_RECORD_HEADER_LENGTH;
+            packet_length = reader.read_u16_from_be(offset + 3).await?
+                + SSL_RECORD_HEADER_LENGTH;
             if packet_length <= SSL_RECORD_HEADER_LENGTH {
                 // Neither SSLv3 or TLSv1 (i.e. SSLv2 or bad data)
                 tls = false;
             }
         } else if version == DTLS_1_0 || version == DTLS_1_2 || version == DTLS_1_3 {
-            if buffer.len() < offset + DTLS_RECORD_HEADER_LENGTH as usize {
-                return Err(Error::NotEnoughDataError);
-            }
-
-            // length is the last 2 bytes in the 13 byte header.
-            packet_length = read_u16(buffer, offset + DTLS_RECORD_HEADER_LENGTH as usize - 2, true)?
+            let packet_length_offset = offset + DTLS_RECORD_HEADER_LENGTH as usize;
+            packet_length = reader.read_u16_from_be(packet_length_offset - 2).await?
                 + DTLS_RECORD_HEADER_LENGTH;
         } else {
             // Neither SSLv3 or TLSv1 (i.e. SSLv2 or bad data)
@@ -242,17 +273,20 @@ pub fn get_encrypted_packet_length(buffer: &[u8], offset: usize) -> Result<u16, 
 
     if !tls {
         // SSLv2 or bad data - Check the version
-        let header_length: usize = if (buffer[offset] & 0x80) != 0 { 2 } else { 3 };
-        let major_version = buffer[offset + header_length + 1];
+        let header_length = if (reader.read_byte(offset).await? & 0x80) != 0 {
+            2
+        } else {
+            3
+        };
 
+        let major_version = reader.read_byte(offset + header_length + 1).await?;
         if major_version == 2 || major_version == 3 {
             // SSLv2
             packet_length = if header_length == 2 {
-                (read_u16(buffer, offset, true)? & 0x7FFF) + 2
+                (reader.read_u16_from_be(offset).await? & 0x7FFF) + 2
             } else {
-                (read_u16(buffer, offset, true)? & 0x3FFF) + 3
+                (reader.read_u16_from_be(offset).await? & 0x3FFF) + 3
             };
-
             if packet_length as usize <= header_length {
                 return Err(Error::NotEnoughDataError);
             }
@@ -264,330 +298,75 @@ pub fn get_encrypted_packet_length(buffer: &[u8], offset: usize) -> Result<u16, 
     Ok(packet_length)
 }
 
-#[inline]
-fn read_u16(bytes: &[u8], offset: usize, is_big_endian: bool) -> Result<u16, Error> {
-    if bytes.len() >= offset + 2 {
-        let slice = &bytes[offset..offset + 2];
-
-        let result = if is_big_endian {
-            u16::from_be_bytes([slice[0], slice[1]])
-        } else {
-            u16::from_ne_bytes([slice[0], slice[1]])
-        };
-
-        Ok(result)
-    } else {
-        Err(Error::NotEnoughDataError)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        get_encrypted_packet_length, is_encrypted, DTLS_RECORD_HEADER_LENGTH,
-        GMSSL_PROTOCOL_VERSION, SSL_CONTENT_TYPE_APPLICATION_DATA, SSL_CONTENT_TYPE_HANDSHAKE,
-        SSL_RECORD_HEADER_LENGTH, Error
-    };
-
-    #[test]
-    fn test_is_encrypted_true_for_known_encrypted_data() {
-        // Example buffer setup - you'll need actual encrypted data for meaningful tests
-        let buffer: Vec<u8> = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE, // Pretend this is part of an encrypted packet
-            0x03,
-            0x03, // Version TLS 1.2
-            0x00,
-            0x14, // Length
-                  // ... additional bytes that represent an encrypted packet
-        ];
-        assert!(is_encrypted(&buffer, 0));
-    }
-
-    #[test]
-    fn test_is_encrypted_false_for_short_buffer() {
-        let buffer: Vec<u8> = vec![SSL_CONTENT_TYPE_HANDSHAKE]; // Insufficient data
-        assert!(!is_encrypted(&buffer, 0));
-    }
-
-    #[test]
-    fn test_get_encrypted_packet_length_with_valid_data() {
-        let buffer: Vec<u8> = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE, // Pretend this is part of an encrypted packet
-            0x03,
-            0x03, // Version TLS 1.2
-            0x00,
-            0x14, // Length
-                  // ... additional bytes that represent an encrypted packet
-        ];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert_eq!(result, Ok(20 + SSL_RECORD_HEADER_LENGTH));
-    }
-
-    #[test]
-    fn test_get_encrypted_packet_length_with_not_encrypted_error() {
-        let buffer: Vec<u8> = vec![0x00]; // Data that does not match any known encrypted format
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert!(matches!(result, Err(Error::NotEncryptedError)));
-    }
-
-    #[test]
-    fn test_get_encrypted_packet_length_with_not_enough_data_error() {
-        let buffer: Vec<u8> = vec![SSL_CONTENT_TYPE_HANDSHAKE]; // Insufficient data
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert!(matches!(result, Err(Error::NotEnoughDataError)));
-    }
-
-    #[test]
-    fn test_encrypted_handshake_length() {
-        // Simulating a buffer that includes an SSL/TLS handshake message
-        let buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03, // Major version (TLS)
-            0x03, // Minor version (TLS 1.2)
-            0x00,
-            0x14, // Length of the handshake message
-                  // The actual handshake message would follow here
-        ];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert_eq!(result, Ok(SSL_RECORD_HEADER_LENGTH + 20)); // Expected length includes the header
-    }
-
-    #[test]
-    fn test_is_not_encrypted_with_application_data() {
-        // Simulating a buffer that looks like application data but is too short to be valid
-        let buffer = vec![
-            SSL_CONTENT_TYPE_APPLICATION_DATA,
-            0x03,
-            0x01, // Incorrect version for encrypted application data
-        ];
-        assert!(!is_encrypted(&buffer, 0));
-    }
-
-    #[test]
-    fn test_invalid_content_type() {
-        // Buffer with an invalid content type
-        let buffer = vec![0xFF, 0x03, 0x03, 0x00, 0x14];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert!(matches!(result, Err(Error::NotEncryptedError)));
-    }
-
-    #[test]
-    fn test_encrypted_packet_with_insufficient_length() {
-        // Buffer that indicates a longer message than is actually present
-        let buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03,
-            0x03, // TLS 1.2
-            0xFF,
-            0xFF, // Length indicating a very large message
-        ];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert!(matches!(result, Err(Error::NotEnoughDataError)));
-    }
-
-    #[test]
-    fn test_dtls_handshake_length() {
-        // Simulating a DTLS handshake message buffer
-        let buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0xFE,
-            0xFD, // DTLS 1.2
-            0x00,
-            0x01, // Epoch
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x01, // Sequence number
-            0x00,
-            0x14, // Length of the handshake message
-                  // The actual handshake message would follow here
-        ];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert_eq!(result, Ok(DTLS_RECORD_HEADER_LENGTH + 20)); // Expected length includes the header
-    }
-
-    #[test]
-    fn test_buffer_with_offset() {
-        // Testing with a non-zero offset
-        let buffer = vec![
-            0x00, // Some unrelated data
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03,
-            0x03,
-            0x00,
-            0x14,
-            // Followed by the encrypted handshake message
-        ];
-        let result = get_encrypted_packet_length(&buffer, 1); // Start analysis at offset 1
-        assert_eq!(result, Ok(SSL_RECORD_HEADER_LENGTH + 20)); // Expected length includes the header
-    }
-
-    #[test]
-    fn test_gmssl_protocol_version_handling() {
-        // GMSSL protocol version should be recognized as encrypted
-        let buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            ((GMSSL_PROTOCOL_VERSION >> 8) & 0xFF) as u8, // Major version
-            (GMSSL_PROTOCOL_VERSION & 0xFF) as u8,        // Minor version
-            0x00,
-            0x14, // Length of the message
-        ];
-        assert!(is_encrypted(&buffer, 0));
-    }
-
-    #[test]
-    fn test_various_tls_versions() {
-        // Testing with different versions of TLS to ensure they're recognized as encrypted
-        let tls_versions = vec![0x0301, 0x0302, 0x0303, 0x0304]; // TLS 1.0, 1.1, 1.2, 1.3
-
-        for &version in tls_versions.iter() {
-            let buffer = vec![
-                SSL_CONTENT_TYPE_HANDSHAKE,
-                ((version >> 8) & 0xFF) as u8,
-                (version & 0xFF) as u8,
-                0x00,
-                0x14, // Length of the message
-            ];
-            assert!(
-                is_encrypted(&buffer, 0),
-                "Version {:X} should be encrypted",
-                version
-            );
-        }
-    }
-
-    #[test]
-    fn test_partial_message_handling() {
-        // Simulate a buffer that ends partway through the encrypted message
-        let buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03,
-            0x03, // TLS 1.2
-            0x00,
-            0x50, // Length indicating a larger message than is present
-                  // Only part of the message is included
-        ];
-        let result = get_encrypted_packet_length(&buffer, 0);
-        assert!(
-            matches!(result, Err(Error::NotEnoughDataError)),
-            "Should return NotEnoughDataError for partial messages"
-        );
-    }
-
-    #[test]
-    fn test_multiple_messages() {
-        // Buffer containing two complete handshake messages back-to-back
-        let mut buffer = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03,
-            0x03, // TLS 1.2
-            0x00,
-            0x14, // Length of the first message
-                  // The actual first handshake message would follow here (omitted for brevity)
-        ];
-        let second_message = vec![
-            SSL_CONTENT_TYPE_HANDSHAKE,
-            0x03,
-            0x03, // TLS 1.2 again
-            0x00,
-            0x14, // Length of the second message
-                  // The actual second handshake message would follow here (omitted for brevity)
-        ];
-        buffer.extend(second_message);
-
-        // Test that the first message is correctly identified
-        let first_message_result = get_encrypted_packet_length(&buffer, 0);
-        assert_eq!(
-            first_message_result,
-            Ok(SSL_RECORD_HEADER_LENGTH + 20),
-            "First message should be correctly identified"
-        );
-
-        // Assuming the first message and its header total length is known, check the second
-        let offset_for_second_message = SSL_RECORD_HEADER_LENGTH as usize + 20; // Adjust based on actual message length
-        let second_message_result = get_encrypted_packet_length(&buffer, offset_for_second_message);
-        assert_eq!(
-            second_message_result,
-            Ok(SSL_RECORD_HEADER_LENGTH + 20),
-            "Second message should be correctly identified"
-        );
-    }
-}
-
-fn print_hex(slice: &[u8]) -> String {
-    slice.iter().map(|byte| format!("{:02x}", byte)).collect()
-}
-
-pub fn extract_sni_hostname(input: &[u8], offset: usize) -> Result<Option<String>, Error> {
-    let hex_str = print_hex(input);
-    println!("{}", hex_str);
+pub async fn extract_sni_hostname<'a, R>(mut reader: &mut R, offset: usize) -> Result<Option<String>, Error> where
+    R: Read<'a> + 'a {
 
     // We have to skip bytes until SessionID (which sum to 34 bytes in this case).
-    let end_offset = input.len() - 1;
     let mut offset = offset + 34;
 
-    if end_offset - offset >= 6 {
-        let session_id_length = input[offset] as usize;
-        offset += 1 + session_id_length;
+    // we need at least 6 more bytes to extract the host name so let's get them.
+    reader.buffer_to(offset + 6).await?;
 
-        let cipher_suites_length = read_u16(input, offset, true)? as usize;
-        offset += 2 + cipher_suites_length;
+    let session_id_length = reader.read_byte(offset).await? as usize;
+    offset += 1 + session_id_length;
 
-        let compression_methods_length = input[offset] as usize;
-        offset += 1 + compression_methods_length;
+    let cipher_suites_length = reader.read_u16_from_be(offset).await? as usize;
+    offset += 2 + cipher_suites_length;
 
-        let extensions_length = read_u16(input, offset, true)? as usize;
+    let compression_methods_length = reader.read_byte(offset).await? as usize;
+    offset += 1 + compression_methods_length;
+
+    let extensions_length = reader.read_u16_from_be(offset).await? as usize;
+    offset += 2;
+    let extensions_limit = offset + extensions_length;
+
+    reader.buffer_to(extensions_limit).await?;
+
+    while extensions_limit - offset >= 4 {
+        let extension_type = reader.read_u16_from_be(offset).await? as usize;
         offset += 2;
-        let extensions_limit = offset + extensions_length;
 
-        if extensions_limit < input.len() {
+        let extension_length = reader.read_u16_from_be(offset).await? as usize;
+        offset += 2;
 
-            while extensions_limit - offset >= 4 {
-                let extension_type = read_u16(input, offset, true)? as usize;
+        if extensions_limit - offset < extension_length {
+            break;
+        }
+
+        // SNI
+        // See https://tools.ietf.org/html/rfc6066#page-6
+
+        if extension_type == 0 {
+            offset += 2;
+
+            if extensions_limit - offset < 3 {
+                break;
+            }
+
+            let server_name_type = reader.read_byte(offset).await?;
+            offset += 1;
+
+            if server_name_type == 0 {
+                let server_name_length = reader.read_u16_from_be(offset).await? as usize;
                 offset += 2;
 
-                let extension_length = read_u16(input, offset, true)? as usize;
-                offset += 2;
-
-                if extensions_limit - offset < extension_length {
+                if extensions_limit - offset < server_name_length {
                     break;
                 }
 
-                // SNI
-                // See https://tools.ietf.org/html/rfc6066#page-6
-
-                if extension_type == 0 {
-                    offset += 2;
-
-                    if extensions_limit - offset < 3 {
-                        break;
-                    }
-
-                    let server_name_type = input[offset];
-                    offset += 1;
-
-                    if server_name_type == 0 {
-                        let server_name_length = read_u16(input, offset, true)? as usize;
-                        offset += 2;
-
-                        if extensions_limit - offset < server_name_length {
-                            break;
-                        }
-
-                        let hostname_bytes = &input[offset..offset + server_name_length];
-                        return Ok(Some(std::str::from_utf8(hostname_bytes).unwrap().to_ascii_lowercase()))
-                    } else {
-                        break
-                    }
-                }
-
-                offset += extension_length;
+                let hostname_bytes = reader.read_bytes(offset, offset + server_name_length).await?;
+                return Ok(Some(
+                    std::str::from_utf8(hostname_bytes)
+                        .unwrap()
+                        .to_ascii_lowercase(),
+                ));
+            } else {
+                break;
             }
         }
+
+        offset += extension_length;
     }
 
     Ok(None)
 }
-

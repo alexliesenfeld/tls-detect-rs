@@ -28,7 +28,7 @@ pub trait Read<'a> {
     async fn read_byte(&mut self, from_offset: usize) -> std::io::Result<u8>;
 
     /// Peeks or reads u16 from big endian.
-    async fn read_bytes(&mut self, from_offset: usize, to_offset: usize) -> std::io::Result<&'a[u8]>;
+    async fn read_bytes(&mut self, from_offset: usize, to_offset: usize) -> std::io::Result<Vec<u8>>; // TODO: Potentially make this more efficient by returning a slice (be aware of lifetime hurdles!)
 
     /// Peeks or reads u16 from big endian.
     async fn read_u16_from_be(&mut self, offset: usize) -> std::io::Result<u16>;
@@ -298,7 +298,7 @@ where
     Ok(packet_length)
 }
 
-pub async fn extract_sni_hostname<'a, R>(mut reader: &mut R, offset: usize) -> Result<Option<String>, Error> where
+pub async fn extract_sni_hostname<'a, R>(reader: &mut R, offset: usize) -> Result<Option<String>, Error> where
     R: Read<'a> + 'a {
 
     // We have to skip bytes until SessionID (which sum to 34 bytes in this case).
@@ -356,7 +356,7 @@ pub async fn extract_sni_hostname<'a, R>(mut reader: &mut R, offset: usize) -> R
 
                 let hostname_bytes = reader.read_bytes(offset, offset + server_name_length).await?;
                 return Ok(Some(
-                    std::str::from_utf8(hostname_bytes)
+                    std::str::from_utf8(&hostname_bytes)
                         .unwrap()
                         .to_ascii_lowercase(),
                 ));

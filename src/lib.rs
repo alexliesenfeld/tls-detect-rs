@@ -298,13 +298,30 @@ where
     Ok(packet_length)
 }
 
+/// This function extracts the SNI host name from a TLS ClientHello message.
+/// See https://tools.ietf.org/html/rfc5246#section-7.4.1.2
+///
+/// struct {
+///    ProtocolVersion client_version;
+///    Random random;
+///    SessionID session_id;
+///    CipherSuite cipher_suites<2..2^16-2>;
+///    CompressionMethod compression_methods<1..2^8-1>;
+///    select (extensions_present) {
+///        case false:
+///            struct {};
+///        case true:
+///            Extension extensions<0..2^16-1>;
+///    };
+/// } ClientHello;
+///
 pub async fn extract_sni_hostname<'a, R>(reader: &mut R, offset: usize) -> Result<Option<String>, Error> where
     R: Read<'a> + 'a {
 
     // We have to skip bytes until SessionID (which sum to 34 bytes in this case).
     let mut offset = offset + 34;
 
-    // we need at least 6 more bytes to extract the host name so let's get them.
+    // We need at least 6 more bytes to continue so let's get them.
     reader.buffer_to(offset + 6).await?;
 
     let session_id_length = reader.read_byte(offset).await? as usize;

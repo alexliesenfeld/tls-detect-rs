@@ -7,7 +7,7 @@ description = "A library to simplify detection of LTS ClientHello messages in a 
 license = "Apache-2.0"
 keywords = ["https", "tls", "check", "probe"]
 categories = ["network-programming"]
-repository = "https://github.com/alexliesenfeld/unified-port-rs"
+repository = "https://github.com/alexliesenfeld/tls-detect-rs"
 readme = "README.md"
 
 [dependencies]

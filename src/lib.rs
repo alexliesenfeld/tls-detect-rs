@@ -18,17 +18,20 @@
 //! This library contains utilities to simplify operating multiple protocols through a
 //! single network port.
 //!
-use std::fmt::{Display, Formatter};
 use async_trait::async_trait;
+use std::fmt::{Display, Formatter};
 
 #[async_trait]
 pub trait Read<'a> {
-
     /// Peeks or reads byte.
     async fn read_byte(&mut self, from_offset: usize) -> std::io::Result<u8>;
 
     /// Peeks or reads u16 from big endian.
-    async fn read_bytes(&mut self, from_offset: usize, to_offset: usize) -> std::io::Result<Vec<u8>>; // TODO: Potentially make this more efficient by returning a slice (be aware of lifetime hurdles!)
+    async fn read_bytes(
+        &mut self,
+        from_offset: usize,
+        to_offset: usize,
+    ) -> std::io::Result<Vec<u8>>; // TODO: Potentially make this more efficient by returning a slice (be aware of lifetime hurdles!)
 
     /// Peeks or reads u16 from big endian.
     async fn read_u16_from_be(&mut self, offset: usize) -> std::io::Result<u16>;
@@ -188,8 +191,9 @@ const DTLS_RECORD_HEADER_LENGTH: u16 = 13;
 /// or if it encounters an error (e.g., `NotEnoughDataError` or `NotEncryptedError`), in which case it will
 /// return `false`.
 pub async fn is_encrypted<'a, R>(reader: &mut R, offset: usize) -> bool
-    where
-    R: Read<'a>,{
+where
+    R: Read<'a>,
+{
     match get_encrypted_packet_length(reader, offset).await {
         Ok(length) => length > 0,
         Err(_) => false,
@@ -250,13 +254,11 @@ where
         // TLS 1.3 (RFC 8446) is represented by {3, 4}
         // SSL 3.0 is represented as {3, 4} (but this is SSL, not TLS).
         let major_version = reader.read_byte(offset + 1).await?;
-        let version =  reader.read_u16_from_be(offset + 1).await?;
+        let version = reader.read_u16_from_be(offset + 1).await?;
 
-        if major_version == 3 || version == GMSSL_PROTOCOL_VERSION
-        {
+        if major_version == 3 || version == GMSSL_PROTOCOL_VERSION {
             // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1
-            packet_length = reader.read_u16_from_be(offset + 3).await?
-                + SSL_RECORD_HEADER_LENGTH;
+            packet_length = reader.read_u16_from_be(offset + 3).await? + SSL_RECORD_HEADER_LENGTH;
             if packet_length <= SSL_RECORD_HEADER_LENGTH {
                 // Neither SSLv3 or TLSv1 (i.e. SSLv2 or bad data)
                 tls = false;

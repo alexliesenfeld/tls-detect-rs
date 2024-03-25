@@ -1,4 +1,3 @@
-# unified-port
+# tls-detect
 
-This library contains utilities to simplify operating multiple protocols through a
-single network port.
+This library contains utilities to simplify detection of TLS ClientHello messages in a byte stream.

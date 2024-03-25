@@ -1,9 +1,9 @@
 [package]
-name = "unified-port"
+name = "tls-detect"
 version = "0.1.0"
 edition = "2021"
 authors = ["Alexander Liesenfeld <alexander.liesenfeld@outlook.com>"]
-description = "A library to simplify multi-protocol network service simulation on a single port."
+description = "A library to simplify detection of LTS ClientHello messages in a byte stream."
 license = "Apache-2.0"
 keywords = ["https", "tls", "check", "probe"]
 categories = ["network-programming"]
